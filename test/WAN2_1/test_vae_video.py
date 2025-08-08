@@ -1,0 +1,201 @@
+import argparse
+
+import torch
+import torch.distributed as dist
+import time
+from diffusers.video_processor import VideoProcessor
+from diffusers.utils import export_to_video, load_video
+
+from paravae.dist.distributed_env import DistributedEnv
+from paravae.models.WAN2_1.vae import _video_vae
+from paravae.models.WAN2_1.patch_vae import _video_patch_vae
+
+@torch.no_grad()
+def main(args):
+    '''
+    For video generation test: torchrun --nproc_per_node=2 test/WAN2.1/test_vae_video.py
+    '''
+    height = 480
+    width = 768
+
+    torch.cuda.reset_peak_memory_stats()
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    torch.cuda.set_device(rank)
+    DistributedEnv.initialize(None)
+    device = torch.device(f"cuda:{rank}")
+    data_type = torch.bfloat16
+
+    video_processor = VideoProcessor(vae_latent_channels=16)
+    
+    VIDEO_PATCH = "./resources/test_raw_prompt.mp4"
+    VAE_WEIGHT_PATH = "./resources/Wan2.1_VAE.pth"
+    
+    video = load_video(VIDEO_PATCH)
+    batch_size = 1
+    if args.create_video_batch:
+        batch_size = 2
+        video = [video] * batch_size
+    with torch.no_grad():
+        video = video_processor.preprocess_video(video, height, width)
+    video = video.to(device=device, dtype=data_type)
+    
+    mean = [
+        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
+    ]
+    std = [
+        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
+    ]
+    mean = torch.tensor(mean, dtype=data_type, device=device)
+    std = torch.tensor(std, dtype=data_type, device=device)
+    scale = [mean, 1.0 / std]
+    
+    # vae define
+    base_vae = _video_vae(
+        pretrained_path=VAE_WEIGHT_PATH,
+        z_dim=16,
+    ).to(device=device).to(data_type)
+    
+    approximate_patch_vae = _video_vae(
+        pretrained_path=VAE_WEIGHT_PATH,
+        z_dim=16,
+    ).to(device=device).to(data_type)
+    
+    patch_vae = _video_patch_vae(
+        pretrained_path=VAE_WEIGHT_PATH,
+        z_dim=16,
+    ).to(device=device).to(data_type)
+        
+    approximate_patch_vae.enable_approximate_patch()
+    
+    warmup_hidden_state = torch.randn(1, 3, 9, 64, 64, device=device, dtype=data_type, requires_grad=True)
+    
+    # base_vae without grad
+    ## warmup
+    for i in range(3):
+        base_latent = base_vae.encode(warmup_hidden_state, scale)
+        base_vae.decode(base_latent, scale)
+        
+    ## run
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
+    encoded = base_vae.encode(video, scale)    
+    base_decoded = base_vae.decode(encoded, scale)
+    peak_memory = torch.cuda.max_memory_allocated(device=device)
+    if rank == 0:
+        print(f"Base_vae: Input shape: {video.shape}, Time: {time.time() - start_time}, Max memory: {peak_memory / 1024**3:.3f} GB")
+    
+    # base_vae without grad with tiling
+    base_vae.enable_tiling()
+    
+    ## warmup
+    for i in range(3):
+        base_latent = base_vae.encode(warmup_hidden_state, scale)
+        base_vae.decode(base_latent, scale)
+    
+    ## run
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
+    encoded = base_vae.encode(video, scale)    
+    base_tiling_decoded = base_vae.decode(encoded, scale)
+    peak_memory = torch.cuda.max_memory_allocated(device=device)
+    if rank == 0:
+        print(f"Base_vae_tiling: Input shape: {video.shape}, Time: {time.time() - start_time}, Max memory: {peak_memory / 1024**3:.3f} GB")
+  
+    
+    # approximate_patch_vae without grad
+    ## warmup
+    for i in range(3):
+        approximate_patch_vae_latent = approximate_patch_vae.encode(warmup_hidden_state, scale)
+        approximate_patch_vae.decode(approximate_patch_vae_latent, scale)
+        
+    ## run
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
+    encoded = approximate_patch_vae.encode(video, scale)    
+    approximate_patch_decoded = approximate_patch_vae.decode(encoded, scale)
+    peak_memory = torch.cuda.max_memory_allocated(device=device)
+    if rank == 0:
+        print(f"Approximate_patch_vae: Input shape: {video.shape}, Time: {time.time() - start_time}, Max memory: {peak_memory / 1024**3:.3f} GB")
+    
+    # approximate_patch_vae without grad with tiling
+    approximate_patch_vae.enable_tiling()
+    
+    ## warmup
+    for i in range(3):
+        approximate_patch_vae_latent = approximate_patch_vae.encode(warmup_hidden_state, scale)
+        approximate_patch_vae.decode(approximate_patch_vae_latent, scale)
+    
+    ## run
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
+    encoded = approximate_patch_vae.encode(video, scale)    
+    approximate_patch_tiling_decoded = approximate_patch_vae.decode(encoded, scale)
+    peak_memory = torch.cuda.max_memory_allocated(device=device)
+    if rank == 0:
+        print(f"Approximate_patch_vae_tiling: Input shape: {video.shape}, Time: {time.time() - start_time}, Max memory: {peak_memory / 1024**3:.3f} GB")
+  
+    # patch_vae without grad
+    ## warmup
+    for i in range(3):
+        patch_latent = patch_vae.encode(warmup_hidden_state, scale)
+        patch_vae.decode(patch_latent, scale)
+        
+    ## run
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
+    encoded = patch_vae.encode(video, scale)    
+    patch_decoded = patch_vae.decode(encoded, scale)
+    peak_memory = torch.cuda.max_memory_allocated(device=device)
+    if rank == 0:
+        print(f"Patch_vae: Input shape: {video.shape}, Time: {time.time() - start_time}, Max memory: {peak_memory / 1024**3:.3f} GB")
+   
+    # patch_vae without grad with tiling
+    patch_vae.enable_tiling()
+    
+    ## warmup
+    for i in range(3):
+        patch_latent = patch_vae.encode(warmup_hidden_state, scale)
+        patch_vae.decode(patch_latent, scale)
+    
+    ## run
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
+    encoded = patch_vae.encode(video, scale)    
+    patch_tiling_decoded = patch_vae.decode(encoded, scale)
+    peak_memory = torch.cuda.max_memory_allocated(device=device)
+    if rank == 0:
+        print(f"Patch_vae_tiling: Input shape: {video.shape}, Time: {time.time() - start_time}, Max memory: {peak_memory / 1024**3:.3f} GB")
+   
+    
+    # video output
+    if rank == 0:
+        with torch.no_grad():
+            base_videos = video_processor.postprocess_video(base_decoded, output_type="pil")
+            approximate_patch_videos = video_processor.postprocess_video(approximate_patch_decoded, output_type="pil")
+            patch_videos = video_processor.postprocess_video(patch_decoded, output_type="pil")
+            
+            base_tiling_videos = video_processor.postprocess_video(base_tiling_decoded, output_type="pil")
+            approximate_patch_tiling_videos = video_processor.postprocess_video(approximate_patch_tiling_decoded, output_type="pil")
+            patch_tiling_videos = video_processor.postprocess_video(patch_tiling_decoded, output_type="pil")
+        for i in range(batch_size):
+            export_to_video(base_videos[i], f"{height}x{width}_base_wanvae_output{i}.mp4", fps=16)
+            export_to_video(approximate_patch_videos[i], f"{height}x{width}_approximate_patch_wanvae_output{i}.mp4", fps=16)
+            export_to_video(patch_videos[i], f"{height}x{width}_patch_wanvae_output{i}.mp4", fps=16)
+            
+            export_to_video(base_tiling_videos[i], f"{height}x{width}_base_wanvae_tiling_output{i}.mp4", fps=16)
+            export_to_video(approximate_patch_tiling_videos[i], f"{height}x{width}_approximate_patch_wanvae_tiling_output{i}.mp4", fps=16)
+            export_to_video(patch_tiling_videos[i], f"{height}x{width}_patch_wanvae_tiling_output{i}.mp4", fps=16)
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--create_video_batch", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = get_args()
+    main(args)
