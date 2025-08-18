@@ -6,16 +6,16 @@ from paravae.dist.distributed_env import DistributedEnv
 
 def _gather(patch_hidden_state, dim=-1, group=None):
     group_world_size = DistributedEnv.get_group_world_size()
-    local_rank = DistributedEnv.get_local_rank()
+    device = DistributedEnv.get_device()
     
-    patch_height_list = [torch.empty([1], dtype=torch.int64, device=f"cuda:{local_rank}") for _ in range(group_world_size)]
+    patch_height_list = [torch.empty([1], dtype=torch.int64, device=device) for _ in range(group_world_size)]
         
     dist.all_gather(
         patch_height_list, 
         torch.tensor(
             [patch_hidden_state.shape[3]], 
             dtype=torch.int64, 
-            device=f"cuda:{local_rank}"
+            device=device
         ),
         group=DistributedEnv.get_vae_group()
     )
@@ -24,7 +24,7 @@ def _gather(patch_hidden_state, dim=-1, group=None):
         torch.zeros(
             [patch_hidden_state.shape[0], patch_hidden_state.shape[1], patch_hidden_state.shape[2], patch_height_list[i].item(),patch_hidden_state.shape[4]], 
             dtype=patch_hidden_state.dtype,
-            device=f"cuda:{local_rank}",
+            device=device,
             requires_grad=patch_hidden_state.requires_grad
         ) for i in range(group_world_size)
     ]

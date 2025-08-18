@@ -12,6 +12,11 @@ from torch.utils.checkpoint import checkpoint
 
 from paravae.dist.split_gather import split_forward_gather_backward, gather_forward_split_backward
 
+try:
+    import torch_musa
+except ModuleNotFoundError:
+    pass
+
 __all__ = [
     'WanVAE_',
 ]
@@ -875,6 +880,9 @@ def _video_vae(pretrained_path=None, z_dim=16, device='cpu', **kwargs):
         #     torch.load(pretrained_path, map_location=device), assign=True)
         model = load_state_dict(model, pretrained_path, device=device, strict=True, assign=True)
     
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "musa") and torch.musa.is_available():
+        torch.musa.empty_cache()
 
     return model

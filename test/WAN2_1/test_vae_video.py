@@ -2,12 +2,21 @@ import argparse
 
 import torch
 import torch.distributed as dist
+from torch.cuda import set_device, device_count
+from torch.cuda import manual_seed
 from diffusers.video_processor import VideoProcessor
 from diffusers.utils import export_to_video, load_video
 
 from paravae.dist.distributed_env import DistributedEnv
 from paravae.models.WAN2_1.vae import _video_vae
 from paravae.models.WAN2_1.patch_vae import _video_patch_vae
+
+try:
+    import torch_musa
+    from torch_musa.core.device import set_device, device_count
+    from torch_musa.core.random import manual_seed
+except ModuleNotFoundError:
+    pass
 
 @torch.no_grad()
 def main(args):
@@ -17,12 +26,16 @@ def main(args):
     height = 480
     width = 768
 
-    torch.cuda.reset_peak_memory_stats()
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    elif hasattr(torch, "musa") and torch.musa.is_available():
+        torch.musa.reset_peak_memory_stats()
+    backend = DistributedEnv.get_torch_distributed_backend()
+    dist.init_process_group(backend=backend)
+    device = dist.get_rank() % device_count()
+    set_device(device)
     DistributedEnv.initialize(None)
-    device = torch.device(f"cuda:{rank}")
+    rank = dist.get_rank()
     data_type = torch.bfloat16
 
     video_processor = VideoProcessor(vae_latent_channels=16)
