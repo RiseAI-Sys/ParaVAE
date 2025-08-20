@@ -22,5 +22,8 @@ cd ..
 torchrun --nproc_per_node=2 --master-port=29501 test/WAN2_1/test_vae_video.py 
 ```
 
+# Supported Accelerators
+Nvidia and Moore Threads GPU accelerators are supported.
+
 # Acknowledgement
 We learned the design and resued the code from the following projects: [Wan2.1](https://github.com/Wan-Video/Wan2.1), [DistVAE](https://github.com/xdit-project/DistVAE), and [Diffusers](https://github.com/huggingface/diffusers).    
