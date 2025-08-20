@@ -16,6 +16,11 @@ from torch.utils.checkpoint import checkpoint
 from paravae.dist.distributed_env import DistributedEnv
 from paravae.dist.split_gather import split_forward_gather_backward, gather_forward_split_backward
 
+try:
+    import torch_musa
+except ModuleNotFoundError:
+    pass
+
 CACHE_T = 2
 
 class CausalConv3d(nn.Conv3d):
@@ -226,7 +231,7 @@ class PatchConv2d(nn.Conv2d):
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         bs, channels, h, w = input.shape
 
-        group_world_size, global_rank, rank_in_group, local_rank = _get_world_size_and_rank()
+        group_world_size, global_rank, rank_in_group, device = _get_world_size_and_rank()
 
         if (group_world_size == 1):
             if self.padding_mode != 'zeros':
@@ -238,8 +243,8 @@ class PatchConv2d(nn.Conv2d):
             
         else:
             # 1. get the meta data of input tensor and conv operation
-            patch_height_list = [torch.zeros(1, dtype=torch.int64, device=f"cuda:{local_rank}") for _ in range(group_world_size)]
-            dist.all_gather(patch_height_list, torch.tensor([h], dtype=torch.int64, device=f"cuda:{local_rank}"), group=DistributedEnv.get_vae_group())
+            patch_height_list = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(group_world_size)]
+            dist.all_gather(patch_height_list, torch.tensor([h], dtype=torch.int64, device=device), group=DistributedEnv.get_vae_group())
             patch_height_index = _calc_patch_height_index(patch_height_list)
             halo_width = _calc_halo_width_in_h_dim(rank_in_group,  patch_height_index, self.kernel_size[0], self.padding[0], self.stride[0])
             prev_bottom_halo_width: int = 0
@@ -269,7 +274,7 @@ class PatchConv2d(nn.Conv2d):
                 # recv from prev
                 assert patch_height_index[rank_in_group] - halo_width[0] >= patch_height_index[rank_in_group-1], \
                     "width of top halo region is larger than the height of input tensor of last rank"
-                top_halo_recv = torch.empty([bs, channels, halo_width[0], w], dtype=input.dtype, device=f"cuda:{local_rank}")
+                top_halo_recv = torch.empty([bs, channels, halo_width[0], w], dtype=input.dtype, device=device)
                 global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
                 dist.recv(top_halo_recv, global_rank_of_prev, group=DistributedEnv.get_vae_group())
 
@@ -285,7 +290,7 @@ class PatchConv2d(nn.Conv2d):
                 # recv from next
                 assert patch_height_index[rank_in_group+1] + halo_width[1] < patch_height_index[rank_in_group+2], \
                     "width of bottom halo region is larger than the height of input tensor of next rank"
-                bottom_halo_recv = torch.empty([bs, channels, halo_width[1], w], dtype=input.dtype, device=f"cuda:{local_rank}")
+                bottom_halo_recv = torch.empty([bs, channels, halo_width[1], w], dtype=input.dtype, device=device)
                 if global_rank_of_next is None:
                     global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
                 dist.recv(bottom_halo_recv, global_rank_of_next, group=DistributedEnv.get_vae_group())
@@ -376,7 +381,7 @@ class PatchCausalConv3d(nn.Conv3d):
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         bs, channels, d, h, w = input.shape
-        group_world_size, global_rank, rank_in_group, local_rank = _get_world_size_and_rank()
+        group_world_size, global_rank, rank_in_group, device = _get_world_size_and_rank()
 
         if group_world_size == 1:
             if self.padding_mode != 'zeros':
@@ -387,8 +392,8 @@ class PatchCausalConv3d(nn.Conv3d):
                             _triple(0), self.dilation, self.groups)
             
         else:
-            patch_height_list = [torch.zeros(1, dtype=torch.int64, device=f"cuda:{local_rank}") for _ in range(group_world_size)]
-            dist.all_gather(patch_height_list, torch.tensor([h], dtype=torch.int64, device=f"cuda:{local_rank}"), group=DistributedEnv.get_vae_group())
+            patch_height_list = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(group_world_size)]
+            dist.all_gather(patch_height_list, torch.tensor([h], dtype=torch.int64, device=device), group=DistributedEnv.get_vae_group())
             patch_height_index = _calc_patch_height_index(patch_height_list)
             halo_width = _calc_halo_width_in_h_dim(rank_in_group, patch_height_index, self.kernel_size[1], self.padding[1], self.stride[1])
 
@@ -418,7 +423,7 @@ class PatchCausalConv3d(nn.Conv3d):
                 assert patch_height_index[rank_in_group] - halo_width[0] >= patch_height_index[rank_in_group-1], \
                     "width of top halo region is larger than the height of input tensor of last rank"
                 top_halo_recv = torch.empty(
-                    [bs, channels, d, halo_width[0], w], dtype=input.dtype, device=f"cuda:{local_rank}"
+                    [bs, channels, d, halo_width[0], w], dtype=input.dtype, device=device
                 )
                 global_rank_of_prev = DistributedEnv.get_global_rank_from_group_rank(rank_in_group - 1)
                 dist.recv(top_halo_recv, global_rank_of_prev, group=DistributedEnv.get_vae_group())
@@ -431,7 +436,7 @@ class PatchCausalConv3d(nn.Conv3d):
 
             if halo_width[1] > 0:
                 bottom_halo_recv = torch.empty(
-                    [bs, channels, d, halo_width[1], w], dtype=input.dtype, device=f"cuda:{local_rank}"
+                    [bs, channels, d, halo_width[1], w], dtype=input.dtype, device=device
                 )
                 if global_rank_of_next is None:
                     global_rank_of_next = DistributedEnv.get_global_rank_from_group_rank(rank_in_group + 1)
@@ -1260,7 +1265,10 @@ def _video_patch_vae(pretrained_path=None, z_dim=16, device='cpu', **kwargs):
         #     torch.load(pretrained_path, map_location=device), assign=True)
         model = load_state_dict(model, pretrained_path, device=device, strict=True, assign=True)
     
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "musa") and torch.musa.is_available():
+        torch.musa.empty_cache()
 
     return model
 
@@ -1269,8 +1277,8 @@ def _get_world_size_and_rank():
     group_world_size = DistributedEnv.get_group_world_size()
     global_rank = DistributedEnv.get_global_rank()
     rank_in_group = DistributedEnv.get_rank_in_vae_group()
-    local_rank = DistributedEnv.get_local_rank()
-    return group_world_size, global_rank, rank_in_group, local_rank
+    device = DistributedEnv.get_device()
+    return group_world_size, global_rank, rank_in_group, device
 
 def _calc_patch_height_index(patch_height_list: List[Tensor]):
     height_index = []

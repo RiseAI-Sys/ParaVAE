@@ -4,15 +4,24 @@ import random
 import argparse
 import time
 
+from torch.cuda import set_device, device_count
+from torch.cuda import manual_seed
 from paravae.dist.distributed_env import DistributedEnv
 
 from paravae.models.WAN2_1.vae import WanVAE_
 from paravae.models.WAN2_1.adapter import WanVAEAdapter
 
+try:
+    import torch_musa
+    from torch_musa.core.device import set_device, device_count
+    from torch_musa.core.random import manual_seed
+except ModuleNotFoundError:
+    pass
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    manual_seed(seed)
 
 # @torch.no_grad()
 def main():
@@ -39,11 +48,11 @@ def main():
     tiling_test = False
     correctness_test = False
 
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    backend = DistributedEnv.get_torch_distributed_backend()
+    dist.init_process_group(backend=backend)
+    device = dist.get_rank() % device_count()
+    set_device(device)
     DistributedEnv.initialize(None)
-    device = torch.device(f"cuda:{rank}")
     
     data_type = torch.float32
     
@@ -82,7 +91,10 @@ def main():
         
         ## run   
         for i in range(3):
-            torch.cuda.reset_peak_memory_stats()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            elif hasattr(torch, "musa") and torch.musa.is_available():
+                torch.musa.reset_peak_memory_stats()
             start_time = time.time()
             
             latent = base_vae.encode(hidden_state, scale)
@@ -90,8 +102,13 @@ def main():
             loss = pred.mean()
             loss.backward()
             
-            peak_memory = torch.cuda.max_memory_allocated(device=device)
-            if rank == 0:
+            if torch.cuda.is_available():
+                peak_memory = torch.cuda.max_memory_allocated(device=device)
+            elif hasattr(torch, "musa") and torch.musa.is_available():
+                peak_memory = torch.musa.max_memory_allocated(device=device)
+            else:
+                peak_memory = 0
+            if dist.get_rank() == 0:
                 print(f"base_vae: resolution: {args.depth}x{args.height}x{args.width}, time: {time.time() - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
 
         # approximate_patch_vae with grad
@@ -104,7 +121,10 @@ def main():
          
         ## run   
         for i in range(3):
-            torch.cuda.reset_peak_memory_stats()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            elif hasattr(torch, "musa") and torch.musa.is_available():
+                torch.musa.reset_peak_memory_stats()
             start_time = time.time()
             
             latent = approximate_patch_vae.encode(hidden_state, scale)
@@ -116,8 +136,13 @@ def main():
                 if param.grad is not None:
                     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=DistributedEnv.get_vae_group())
             
-            peak_memory = torch.cuda.max_memory_allocated(device=device)
-            if rank == 0:
+            if torch.cuda.is_available():
+                peak_memory = torch.cuda.max_memory_allocated(device=device)
+            elif hasattr(torch, "musa") and torch.musa.is_available():
+                peak_memory = torch.musa.max_memory_allocated(device=device)
+            else:
+                peak_memory = 0
+            if dist.get_rank() == 0:
                 print(f"approximate_patch_vae: resolution: {args.depth}x{args.height}x{args.width}, time: {time.time() - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
 
         # patch_vae with grad
@@ -130,7 +155,10 @@ def main():
         
         ## run
         for i in range(3):
-            torch.cuda.reset_peak_memory_stats()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            elif hasattr(torch, "musa") and torch.musa.is_available():
+                torch.musa.reset_peak_memory_stats()
             start_time = time.time()
     
             patch_latent = patch_vae.encode(hidden_state, scale)
@@ -142,8 +170,13 @@ def main():
                 if param.grad is not None:
                     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=DistributedEnv.get_vae_group())
             
-            peak_memory = torch.cuda.max_memory_allocated(device=device)
-            if rank == 0:
+            if torch.cuda.is_available():
+                peak_memory = torch.cuda.max_memory_allocated(device=device)
+            elif hasattr(torch, "musa") and torch.musa.is_available():
+                peak_memory = torch.musa.max_memory_allocated(device=device)
+            else:
+                peak_memory = 0
+            if dist.get_rank() == 0:
                 print(f"patch_vae: resolution: {args.depth}x{args.height}x{args.width}, time: {time.time() - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
 
     # correctness verification with grad (because of backward)
@@ -178,7 +211,7 @@ def main():
         
         patch_weight_grad = patch_vae.decoder.head[2].weight.grad.clone()
                 
-        if rank == 0:            
+        if dist.get_rank() == 0:            
             print("⭕️ approximate patch pred max error:", (base_pred - approximate_patch_pred).abs().max().item())
             print("⭕️ approximate patch pred mean error:", (base_pred - approximate_patch_pred).abs().mean().item())
             print("✅ approximate patch grad max error:", (base_weight_grad - approximate_patch_weight_grad).abs().max().item())
@@ -208,36 +241,60 @@ def main():
         
         # approximate_patch_vae
         start_time = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            torch.musa.reset_peak_memory_stats()
         with torch.no_grad():
             encoded = approximate_patch_vae.encode(hidden_state, scale)
             approximate_patch_decoded = approximate_patch_vae.decode(encoded, scale)
-        peak_memory = torch.cuda.max_memory_allocated(device=device)
-        if rank == 0:
+        if torch.cuda.is_available():
+            peak_memory = torch.cuda.max_memory_allocated(device=device)
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            peak_memory = torch.musa.max_memory_allocated(device=device)
+        else:
+            peak_memory = 0
+        if dist.get_rank() == 0:
             print(f"approximate_patch_vae + tiling: resolution: {hidden_state.shape}, time: {time.time() - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
             
         # patch_vae
         start_time = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            torch.musa.reset_peak_memory_stats()
         with torch.no_grad():
             encoded = patch_vae.encode(hidden_state, scale)
             patch_decoded = patch_vae.decode(encoded, scale) 
-        peak_memory = torch.cuda.max_memory_allocated(device=device)
-        if rank == 0:
+        if torch.cuda.is_available():
+            peak_memory = torch.cuda.max_memory_allocated(device=device)
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            peak_memory = torch.musa.max_memory_allocated(device=device)
+        else:
+            peak_memory = 0
+        if dist.get_rank() == 0:
             print(f"patch_vae + tiling: resolution: {hidden_state.shape}, time: {time.time() - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
             
         
         # base_vae
         start_time = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            torch.musa.reset_peak_memory_stats()
         with torch.no_grad():
             encoded = base_vae.encode(hidden_state, scale)
             base_decoded = base_vae.decode(encoded, scale)
-        peak_memory = torch.cuda.max_memory_allocated(device=device)
-        if rank == 0:
+        if torch.cuda.is_available():
+            peak_memory = torch.cuda.max_memory_allocated(device=device)
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            peak_memory = torch.musa.max_memory_allocated(device=device)
+        else:
+            peak_memory = 0
+        if dist.get_rank() == 0:
             print(f"base_vae: resolution: {hidden_state.shape}, time: {time.time() - start_time} sec, peak memory: {peak_memory / 2 ** 30} GB")
             
-        if rank == 0:            
+        if dist.get_rank() == 0:            
             print("⭕️ approximate patch with tiling decoded max error:", (approximate_patch_decoded - base_decoded).abs().max().item())
             print("⭕️ approximate patch with tiling decoded mean error:", (approximate_patch_decoded - base_decoded).abs().mean().item())
             print("⭕️ patch decoded with tiling max error:", (patch_decoded - base_decoded).abs().max().item())
