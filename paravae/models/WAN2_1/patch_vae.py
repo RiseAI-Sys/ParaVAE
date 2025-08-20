@@ -857,6 +857,16 @@ class PatchDecoder3d(nn.Module):
                
         x = split_forward_gather_backward(None, x, 3)
 
+        ZERO_HEIGHT = False
+        if x.shape[3] == 0:
+            ZERO_HEIGHT = True
+            x = torch.zeros(
+                [x.shape[0], x.shape[1], x.shape[2], 1, x.shape[4]],
+                dtype=x.dtype,
+                device=x.device,
+                requires_grad=x.requires_grad
+            )
+
         ## upsamples
         for layer in self.upsamples:
             if feat_cache is not None:
@@ -882,6 +892,14 @@ class PatchDecoder3d(nn.Module):
             else:
                 x = layer(x)
         
+        if ZERO_HEIGHT:
+            x = torch.zeros(
+                [x.shape[0], x.shape[1], x.shape[2], 0, x.shape[4]],
+                dtype=x.dtype,
+                device=x.device,
+                requires_grad=x.requires_grad
+            )
+
         x = gather_forward_split_backward(None, x, 3)
         
         return x
